@@ -21,8 +21,9 @@ Usage examples:
 
 import argparse
 import math
+import os
 
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 from transformers import (
     DataCollatorForLanguageModeling,
@@ -56,6 +57,12 @@ def parse_args():
     p.add_argument("--n_embd", type=int, default=768)
     # Training
     p.add_argument("--output_dir", required=True)
+    p.add_argument("--packed_dir", default=None,
+                   help="Where to save/load the preprocessed packed dataset "
+                        "(default: <output_dir>/packed_ds)")
+    p.add_argument("--prepare_only", action="store_true",
+                   help="Run tokenizer training + tokenize/pack + save_to_disk, then exit. "
+                        "Run this once single-process before launching training with torchrun.")
     p.add_argument("--num_train_epochs", type=float, default=1.0)
     p.add_argument("--max_steps", type=int, default=-1, help="Overrides epochs if > 0")
     p.add_argument("--per_device_train_batch_size", type=int, default=16)
@@ -80,6 +87,14 @@ def load_raw_dataset(args):
     drop = [c for c in ds.column_names if c != args.text_column]
     if drop:
         ds = ds.remove_columns(drop)
+    # Drop empty/whitespace-only items so they don't inject bare EOS tokens
+    # into the packed stream.
+    ds = ds.filter(
+        lambda batch: [t is not None and t.strip() != "" for t in batch[args.text_column]],
+        batched=True,
+        num_proc=args.num_proc,
+        desc="Dropping empty items",
+    )
     return ds
 
 
@@ -162,26 +177,45 @@ def build_model(tok, args):
 
 def main():
     args = parse_args()
+    packed_dir = args.packed_dir or os.path.join(args.output_dir, "packed_ds")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
-    print("Loading dataset...")
-    raw = load_raw_dataset(args)
-    raw = raw.filter(
-        lambda batch: [t is not None and t.strip() != "" for t in batch[args.text_column]],
-        batched=True,
-        num_proc=args.num_proc,
-        desc="Dropping empty items",
-    )
-    print(f"  {len(raw):,} items")
+    if os.path.isdir(packed_dir):
+        # ---- Fast path: reuse preprocessed dataset + tokenizer ----
+        print(f"Loading packed dataset from {packed_dir} ...")
+        lm_ds = load_from_disk(packed_dir)
+        tok = PreTrainedTokenizerFast.from_pretrained(args.output_dir)
+        print(f"  {len(lm_ds):,} blocks, vocab size {len(tok):,}")
+    else:
+        # ---- Preprocessing path: run this once, single-process ----
+        if world_size > 1:
+            raise RuntimeError(
+                f"Packed dataset not found at {packed_dir}, but running with "
+                f"WORLD_SIZE={world_size}. Preprocess first on a single process:\n"
+                f"  python train_gpt2_scratch.py ... --prepare_only\n"
+                f"then relaunch training with torchrun."
+            )
 
-    print("Training tokenizer...")
-    tok = train_tokenizer(raw, args.text_column, args.vocab_size, args.tokenizer_sample_size)
-    tok.save_pretrained(args.output_dir)
-    print(f"  vocab size: {len(tok):,} (saved to {args.output_dir})")
+        print("Loading dataset...")
+        raw = load_raw_dataset(args)
+        print(f"  {len(raw):,} items")
 
-    print("Tokenizing and packing...")
-    lm_ds = tokenize_and_pack(raw, tok, args.text_column, args.block_size, args.num_proc)
+        print("Training tokenizer...")
+        tok = train_tokenizer(raw, args.text_column, args.vocab_size, args.tokenizer_sample_size)
+        tok.save_pretrained(args.output_dir)
+        print(f"  vocab size: {len(tok):,} (saved to {args.output_dir})")
+
+        print("Tokenizing and packing...")
+        lm_ds = tokenize_and_pack(raw, tok, args.text_column, args.block_size, args.num_proc)
+        print(f"Saving packed dataset to {packed_dir} ...")
+        lm_ds.save_to_disk(packed_dir)
+
     n_tokens = len(lm_ds) * args.block_size
     print(f"  {len(lm_ds):,} blocks of {args.block_size} = {n_tokens / 1e6:.1f}M tokens")
+
+    if args.prepare_only:
+        print("Preparation done (--prepare_only). Exiting before training.")
+        return
 
     split = lm_ds.train_test_split(test_size=args.validation_fraction, seed=args.seed)
     train_ds, eval_ds = split["train"], split["test"]
