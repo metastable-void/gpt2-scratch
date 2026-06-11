@@ -71,6 +71,16 @@ def parse_args():
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--weight_decay", type=float, default=0.1)
     p.add_argument("--bf16", action="store_true")
+    # Performance
+    p.add_argument("--attn", default="sdpa", choices=["sdpa", "flash_attention_2", "eager"],
+                   help="Attention backend. sdpa needs nothing extra; flash_attention_2 "
+                        "requires the flash-attn package.")
+    p.add_argument("--torch_compile", action="store_true",
+                   help="Compile the model with torch.compile (one-time warmup cost, "
+                        "then faster steps).")
+    p.add_argument("--optim", default="adamw_torch_fused",
+                   help="Optimizer (TrainingArguments.optim). Fused AdamW is fastest on CUDA.")
+    p.add_argument("--dataloader_num_workers", type=int, default=8)
     p.add_argument("--resume_from_checkpoint", default=None,
                    help="Path to a checkpoint dir to resume from (e.g. output_dir/checkpoint-3000)")
     p.add_argument("--seed", type=int, default=42)
@@ -171,6 +181,7 @@ def build_model(tok, args):
         bos_token_id=tok.bos_token_id,
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.pad_token_id,
+        attn_implementation=args.attn,
     )
     model = GPT2LMHeadModel(config)  # random init — NOT from_pretrained
     print(f"Model parameters: {model.num_parameters() / 1e6:.1f}M")
@@ -245,6 +256,11 @@ def main():
         weight_decay=args.weight_decay,
         adam_beta2=0.95,
         bf16=args.bf16,
+        tf32=True,
+        optim=args.optim,
+        torch_compile=args.torch_compile,
+        dataloader_num_workers=args.dataloader_num_workers,
+        dataloader_pin_memory=True,
         logging_steps=50,
         eval_strategy="steps",
         eval_steps=1000,
