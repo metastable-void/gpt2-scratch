@@ -23,10 +23,10 @@ import argparse
 import math
 import os
 
+import torch
 from datasets import load_dataset, load_from_disk
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 from transformers import (
-    DataCollatorForLanguageModeling,
     GPT2Config,
     GPT2LMHeadModel,
     PreTrainedTokenizerFast,
@@ -71,6 +71,8 @@ def parse_args():
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--weight_decay", type=float, default=0.1)
     p.add_argument("--bf16", action="store_true")
+    p.add_argument("--resume_from_checkpoint", default=None,
+                   help="Path to a checkpoint dir to resume from (e.g. output_dir/checkpoint-3000)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num_proc", type=int, default=4, help="Workers for dataset map()")
     return p.parse_args()
@@ -222,8 +224,14 @@ def main():
 
     model = build_model(tok, args)
 
-    # mlm=False -> causal LM: labels are input_ids shifted internally by the model.
-    collator = DataCollatorForLanguageModeling(tokenizer=tok, mlm=False)
+    # IMPORTANT: do NOT use DataCollatorForLanguageModeling here. With pad==eos,
+    # it sets labels[labels == pad_token_id] = -100, which masks every EOS out of
+    # the loss -> the model never learns to emit EOS. Blocks are uniform length
+    # (no padding), so labels are simply a copy of input_ids; the model shifts
+    # them internally for causal LM.
+    def collator(features):
+        ids = torch.tensor([f["input_ids"] for f in features], dtype=torch.long)
+        return {"input_ids": ids, "labels": ids.clone()}
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -256,7 +264,7 @@ def main():
         data_collator=collator,
     )
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
     metrics = trainer.evaluate()
     print(f"Final eval loss: {metrics['eval_loss']:.4f} "
