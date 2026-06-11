@@ -165,6 +165,12 @@ def main():
 
     print("Loading dataset...")
     raw = load_raw_dataset(args)
+    raw = raw.filter(
+        lambda batch: [t is not None and t.strip() != "" for t in batch[args.text_column]],
+        batched=True,
+        num_proc=args.num_proc,
+        desc="Dropping empty items",
+    )
     print(f"  {len(raw):,} items")
 
     print("Training tokenizer...")
